@@ -3,6 +3,9 @@ import 'dotenv/config';
 import http from 'https';
 import axios, { AxiosError } from 'axios';
 
+import { CronJob } from 'cron';
+import winston from 'winston';
+
 export interface DnsRecords {
   status: string;
   cloudflare: string;
@@ -29,6 +32,15 @@ const secretApiKey = process.env.SecretKey!;
 const apiKey = process.env.APIKey!;
 const domain = process.env.Domain!;
 
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+    winston.format.timestamp({ format: 'MMM-DD-YYYY HH:mm:ss' }),
+    winston.format.align(),
+    winston.format.printf(info => `${[info.timestamp]}: ${info.message}`),
+  ),
+  transports: [new winston.transports.File({ filename: 'logs/combined.log' })],
+});
 // https://www.ipify.org/
 
 // const options = {
@@ -71,13 +83,6 @@ const updateAddressDNSRecordsByDomain = (domain: string, newAddress: string) => 
   if (name.endsWith('.')) {
     name = name.replace(/.$/, '');
   }
-  console.log({
-    name,
-    type: record.type,
-    content: newAddress,
-    ttl: record.ttl,
-  });
-
   const response = await axios.post<{ status: string }>(`${originEndpoint}/dns/edit/${domain}/${record.id}`, {
     name,
     secretapikey: secretApiKey,
@@ -90,10 +95,14 @@ const updateAddressDNSRecordsByDomain = (domain: string, newAddress: string) => 
 };
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
-
+let currentPublicIp = '';
 const run = async () => {
-  const currentPublicIp = await getCurrentPublicIp();
-  console.log(currentPublicIp);
+  const newPublicIp = await getCurrentPublicIp();
+  if (newPublicIp === currentPublicIp) {
+    logger.info(`Public IP was not changed.`);
+    return;
+  }
+  currentPublicIp = newPublicIp;
   const dnsRecords = await retrieveDNSRecordsByDomain(domain);
   const updater = updateAddressDNSRecordsByDomain(domain, currentPublicIp);
   for (let index = 0, length = dnsRecords.length; index < length; index++) {
@@ -101,30 +110,33 @@ const run = async () => {
     if (record.content !== currentPublicIp) {
       try {
         const result = await updater(record);
-        console.log(`Updated ${record.name} to ${currentPublicIp}: ${result?.status}`);
+        logger.info(`Updated ${record.name} to ${currentPublicIp}: ${result?.status}`);
         await sleep(3000);
       } catch (error) {
         if (error instanceof AxiosError) {
-          console.log(`Failed to update ${record.name}`);
-          console.log({
-            code: error.code,
-            data: error.response?.data,
-          });
+          logger.info(`Failed to update ${record.name}`);
         } else {
-          console.log(error);
+          logger.error((error as any)?.message || 'Unknown error');
         }
       }
     } else {
-      console.log(`Nothing changes ${record.name} to ${currentPublicIp}`);
+      logger.info(`Nothing changes ${record.name} to ${currentPublicIp}`);
     }
   }
 };
 
-run()
-  .then(() => {
-    console.log(`Porkbun was updated.`);
-  })
-  .catch(error => {
-    console.error(error);
-    process.exit(1);
-  });
+const onTick = () => {
+  run()
+    .then(() => {
+      // logger.error(error?.message || 'Unknown error');
+    })
+    .catch(error => {
+      logger.error(error?.message || 'Unknown error');
+    });
+};
+const onComplete = () => {};
+const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+const startNow = false;
+const runOnInit = true;
+const job = new CronJob('0 */30 * * * *', onTick, onComplete, startNow, timeZone, null, runOnInit);
+job.start();
